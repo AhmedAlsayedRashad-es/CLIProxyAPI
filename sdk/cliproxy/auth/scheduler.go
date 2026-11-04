@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategySoonestResetFirst  schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -170,6 +171,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *SoonestResetFirstSelector:
+		return schedulerStrategySoonestResetFirst
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -187,6 +190,16 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
 	clear(s.mixedWeightedStates)
+	if s.strategy == schedulerStrategySoonestResetFirst {
+		// Other strategies can leave unrelated model shards on older snapshots.
+		// Account reset ordering needs the latest observations in every shard.
+		now := time.Now()
+		for _, provider := range s.providers {
+			for _, meta := range provider.auths {
+				provider.upsertAuthForModelsLocked(meta, nil, true, now)
+			}
+		}
+	}
 }
 
 // isSchedulableAuth determines whether an auth can be scheduled by a provider scheduler,
@@ -514,6 +527,34 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 	}
 	if !hasCandidate {
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+
+	if strategy == schedulerStrategySoonestResetFirst {
+		var picked *Auth
+		var pickedProvider string
+		var pickedReset time.Time
+		for providerIndex, providerKey := range normalized {
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			bucket := shard.readyByPriority[bestPriority]
+			if bucket == nil {
+				continue
+			}
+			candidate := bucket.all.pickSoonestReset(predicate, now)
+			if candidate == nil {
+				continue
+			}
+			reset := nextQuotaReset(candidate.auth, now)
+			if picked == nil || quotaResetComesFirst(reset, candidate.auth.ID, pickedReset, picked.ID) {
+				picked, pickedProvider, pickedReset = candidate.auth, providerKey, reset
+			}
+		}
+		if picked != nil {
+			return picked, pickedProvider, nil
+		}
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 	}
 
@@ -918,6 +959,10 @@ func (s *authScheduler) upsertAuthResultLocked(auth *Auth, targetModels []string
 	authID := strings.TrimSpace(auth.ID)
 	if authID == "" {
 		return
+	}
+	if s.strategy == schedulerStrategySoonestResetFirst {
+		// A quota observation from one model changes account ordering for all models.
+		credentialScoped = true
 	}
 
 	providerKey := executorKeyFromAuth(auth)
@@ -1384,6 +1429,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategySoonestResetFirst:
+		picked = view.pickSoonestReset(predicate, time.Now())
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
