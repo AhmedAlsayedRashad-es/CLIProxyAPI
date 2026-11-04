@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clientusage"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -64,6 +65,9 @@ func (s *Service) Run(ctx context.Context) error {
 		cfg = s.cfg
 		s.cfgMu.Unlock()
 		redisqueue.SetUsageStatisticsEnabled(true)
+	}
+	if !homeEnabled {
+		go clientusage.Default().Run(ctx, clientusage.StatePath(s.configPath), clientusage.DefaultSaveInterval)
 	}
 
 	defer func() {
@@ -390,6 +394,9 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		usage.StopDefault()
+		if errFlush := clientusage.Default().Flush(); errFlush != nil {
+			log.Warnf("client key usage: %v", errFlush)
+		}
 	})
 	return shutdownErr
 }
